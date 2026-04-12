@@ -230,6 +230,75 @@ async function resolveOllamaModel(forceRefresh = false) {
   }
 }
 
+async function getOllamaModelCandidates(preferredModel) {
+  const candidates = [];
+  const seen = new Set();
+  const add = (name) => {
+    if (!name || seen.has(name)) return;
+    seen.add(name);
+    candidates.push(name);
+  };
+
+  add(preferredModel);
+  add(warmedModel);
+
+  const preferredFallbackOrder = ['phi:latest', 'llama3.1:latest', 'llama3:latest', 'codellama:latest'];
+  for (const modelName of preferredFallbackOrder) add(modelName);
+
+  try {
+    const response = await fetchWithTimeout(OLLAMA_BASE_URL + '/api/tags');
+    if (response.ok) {
+      const data = await response.json();
+      const models = Array.isArray(data?.models) ? data.models : [];
+      for (const m of models) {
+        add(m?.name);
+      }
+    }
+  } catch (_err) {
+    // Ignore model listing failures; static fallbacks still apply.
+  }
+
+  return candidates;
+}
+
+async function generateWithOllamaModel(model, prompt, estimatedPredict) {
+  const response = await fetchWithTimeout(OLLAMA_BASE_URL + '/api/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model,
+      prompt,
+      stream: false,
+      keep_alive: OLLAMA_KEEP_ALIVE,
+      options: {
+        temperature: 0.0,
+        num_predict: estimatedPredict,
+        top_p: 0.9,
+        repeat_penalty: 1.05,
+        num_ctx: 2048,
+        num_batch: 8
+      }
+    })
+  });
+
+  if (!response.ok) {
+    let detail = '';
+    try {
+      detail = await response.text();
+    } catch (_err) {
+      detail = '';
+    }
+    throw new Error(`Ollama error: ${response.status}${detail ? ` - ${detail.slice(0, 200)}` : ''}`);
+  }
+
+  const data = await response.json();
+  if (!data.response) {
+    throw new Error('Invalid response');
+  }
+
+  return data;
+}
+
 function normalizeLanguage(lang) {
   return LANGUAGE_MAP[lang.toLowerCase().trim()] || lang;
 }
@@ -817,7 +886,7 @@ function callHFService(code, sourceLang, targetLang) {
 // Call Python hybrid converter (rule-based)
 function callPythonConverter(code, sourceLang, targetLang) {
   return new Promise((resolve, reject) => {
-    const pythonPath = 'python';
+    const pythonPath = process.env.PYTHON_EXECUTABLE || 'python';
     const scriptPath = path.join(__dirname, 'hybridConverter.py');
     
     const child = spawn(pythonPath, [scriptPath, code, sourceLang, targetLang], {
@@ -850,6 +919,19 @@ function callPythonConverter(code, sourceLang, targetLang) {
     
     child.on('error', (err) => {
       reject(new Error(`Failed to start rule-based converter: ${err.message}`));
+    });
+
+    const timeoutId = setTimeout(() => {
+      try {
+        child.kill('SIGTERM');
+      } catch (_err) {
+        // ignore kill errors
+      }
+      reject(new Error(`Rule-based converter timed out after ${TRAINED_MODEL_TIMEOUT_MS}ms`));
+    }, TRAINED_MODEL_TIMEOUT_MS);
+
+    child.on('exit', () => {
+      clearTimeout(timeoutId);
     });
   });
 }
@@ -952,11 +1034,47 @@ async function convertCode(code, sourceLanguage, targetLanguage) {
             conversionTime: `${duration}s`
           };
         }
+
+        const fallbackResult = await callPythonConverter(code, source, target);
+        if (fallbackResult.success) {
+          cacheSet(cacheKey, {
+            result: fallbackResult.convertedCode,
+            provider: fallbackResult.provider || 'Rule-Based Python-C++ Converter',
+            timestamp: Date.now()
+          });
+
+          const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+          return {
+            success: true,
+            convertedCode: fallbackResult.convertedCode,
+            provider: fallbackResult.provider || 'Rule-Based Python-C++ Converter',
+            conversionTime: `${duration}s`
+          };
+        }
       } catch (err) {
-        return {
-          success: false,
-          error: err.message
-        };
+        try {
+          const fallbackResult = await callPythonConverter(code, source, target);
+          if (fallbackResult.success) {
+            cacheSet(cacheKey, {
+              result: fallbackResult.convertedCode,
+              provider: fallbackResult.provider || 'Rule-Based Python-C++ Converter',
+              timestamp: Date.now()
+            });
+
+            const duration = ((Date.now() - startTime) / 1000).toFixed(1);
+            return {
+              success: true,
+              convertedCode: fallbackResult.convertedCode,
+              provider: fallbackResult.provider || 'Rule-Based Python-C++ Converter',
+              conversionTime: `${duration}s`
+            };
+          }
+        } catch (fallbackErr) {
+          return {
+            success: false,
+            error: `Trained model failed: ${err.message}; Rule-based fallback failed: ${fallbackErr.message}`
+          };
+        }
       }
 
       return {
@@ -1010,36 +1128,30 @@ async function convertCode(code, sourceLanguage, targetLanguage) {
     try {
       const startTime = Date.now();
     
-    // Resolve model with shared in-flight promise to avoid repeated /api/tags lookups.
+      // Resolve model with shared in-flight promise to avoid repeated /api/tags lookups.
       const model = await resolveOllamaModel();
     
       const estimatedPredict = estimatePredictTokens(normalizedCode, source, target);
 
-      const response = await fetchWithTimeout(OLLAMA_BASE_URL + '/api/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: model,
-        prompt: prompt,
-        stream: false,
-          keep_alive: OLLAMA_KEEP_ALIVE,
-          options: {
-            temperature: 0.0,
-            num_predict: estimatedPredict,
-            top_p: 0.9,
-            repeat_penalty: 1.05,
-            num_ctx: 2048,
-            num_batch: 8
-          }
-      })
-      });
+      const modelCandidates = await getOllamaModelCandidates(model);
+      let usedModel = model;
+      let data = null;
+      let lastError = null;
 
-      if (!response.ok) {
-        throw new Error(`Ollama error: ${response.status}`);
+      for (const candidate of modelCandidates) {
+        try {
+          data = await generateWithOllamaModel(candidate, prompt, estimatedPredict);
+          usedModel = candidate;
+          break;
+        } catch (err) {
+          lastError = err;
+          console.warn(`Ollama model attempt failed (${candidate}): ${err.message}`);
+        }
       }
 
-      const data = await response.json();
-      if (!data.response) throw new Error('Invalid response');
+      if (!data) {
+        throw lastError || new Error('All Ollama model attempts failed');
+      }
 
       let convertedCode = extractCode(data.response).trim();
 
@@ -1055,7 +1167,7 @@ async function convertCode(code, sourceLanguage, targetLanguage) {
       // Cache result
       cacheSet(cacheKey, {
         result: convertedCode,
-        provider: `Ollama (${model})`,
+        provider: `Ollama (${usedModel})`,
         timestamp: Date.now()
       });
 
@@ -1064,7 +1176,7 @@ async function convertCode(code, sourceLanguage, targetLanguage) {
       return {
         success: true,
         convertedCode,
-        provider: `Ollama (${model})`,
+        provider: `Ollama (${usedModel})`,
         conversionTime: `${duration}s`
       };
     } catch (error) {
