@@ -1,0 +1,37 @@
+services:
+  - type: web
+    name: ai-code-translator-backend
+    runtime: node
+    rootDir: backend
+    buildCommand: npm install; pip install -r requirements.txt
+    startCommand: npm run start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 20
+      - key: PORT
+        value: 6001
+      - key: OLLAMA_BASE_URL
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false
+      - key: JSON_LIMIT
+        value: 1mb
+      - key: RATE_LIMIT_WINDOW_MS
+        value: 60000
+      - key: RATE_LIMIT_MAX
+        value: 60
+      - key: CONVERT_TIMEOUT_MS
+        value: 45000
+      - key: OLLAMA_TIMEOUT_MS
+        value: 30000
+      - key: OLLAMA_KEEP_ALIVE
+        value: 15m
+      - key: OLLAMA_MODEL_REFRESH_MS
+        value: 300000
+      - key: TRAINED_MODEL_TIMEOUT_MS
+        value: 60000
+      - key: TRAINED_MODEL_PERSISTENT
+        value: 1
+      - key: TRAINED_MODEL_WORKER_IDLE_MS
+        value: 120000

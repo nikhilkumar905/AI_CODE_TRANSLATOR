@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Translator Perf Checker</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <header>
+        <h1>Conversion Perf + Accuracy Checker</h1>
+        <p>Run repeated conversion tests and inspect latency, provider, and rough similarity score.</p>
+      </header>
+
+      <section class="panel grid">
+        <label>
+          Backend URL
+          <input id="backendUrl" type="text" value="http://localhost:6001" />
+        </label>
+
+        <label>
+          Source Language
+          <select id="sourceLanguage">
+            <option value="c">C</option>
+            <option value="cpp" selected>C++</option>
+            <option value="java">Java</option>
+            <option value="python">Python</option>
+            <option value="javascript">JavaScript</option>
+          </select>
+        </label>
+
+        <label>
+          Target Language
+          <select id="targetLanguage">
+            <option value="c">C</option>
+            <option value="cpp">C++</option>
+            <option value="java">Java</option>
+            <option value="python" selected>Python</option>
+            <option value="javascript">JavaScript</option>
+          </select>
+        </label>
+
+        <label>
+          Runs
+          <input id="runs" type="number" min="1" max="50" value="5" />
+        </label>
+      </section>
+
+      <section class="panel split">
+        <label>
+          Input Code
+          <textarea id="inputCode" rows="12">int main(){
+  int n = 10;
+  int s = 0;
+  for (int i = 0; i &lt; n; ++i) s += i;
+  return s;
+}</textarea>
+        </label>
+        <label>
+          Expected Output (Optional)
+          <textarea id="expectedCode" rows="12">def main():
+    n = 10
+    s = 0
+    for i in range(0, n):
+        s += i
+    return s</textarea>
+        </label>
+      </section>
+
+      <section class="panel actions">
+        <button id="runBtn">Run Benchmark</button>
+        <button id="resetPerfBtn">Reset Backend Perf Counters</button>
+        <button id="fetchPerfBtn">Fetch Backend Perf Snapshot</button>
+      </section>
+
+      <section class="panel">
+        <h2>Run Results</h2>
+        <div id="summary" class="summary">No benchmark run yet.</div>
+        <pre id="details" class="output"></pre>
+      </section>
+
+      <section class="panel">
+        <h2>Backend Perf Snapshot (/health/perf)</h2>
+        <pre id="backendPerf" class="output"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>
