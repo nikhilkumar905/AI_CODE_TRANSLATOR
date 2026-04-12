@@ -18,6 +18,16 @@ const TRAINED_MODEL_PERSISTENT = process.env.TRAINED_MODEL_PERSISTENT !== '0';
 const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || '15m';
 const OLLAMA_MODEL_REFRESH_MS = Number(process.env.OLLAMA_MODEL_REFRESH_MS || 300000);
 
+function resolveOllamaBaseUrl() {
+  let base = (process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434').trim().replace(/\/+$/, '');
+  if (/^http:\/\/.+ngrok-free\.(app|dev)$/i.test(base)) {
+    base = `https://${base.slice('http://'.length)}`;
+  }
+  return base;
+}
+
+const OLLAMA_BASE_URL = resolveOllamaBaseUrl();
+
 // Cache for repeated conversions
 const conversionCache = new Map();
 const CACHE_TTL = 300000; // 5 minutes
@@ -161,10 +171,16 @@ function cacheSet(key, value) {
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = OLLAMA_TIMEOUT_MS) {
+  const hostLooksLikeNgrok = /ngrok(-free)?\.(app|dev|io)/i.test(url);
+  const headerBag = { ...(options.headers || {}) };
+  if (hostLooksLikeNgrok && !headerBag['ngrok-skip-browser-warning']) {
+    headerBag['ngrok-skip-browser-warning'] = 'true';
+  }
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, signal: controller.signal });
+    return await fetch(url, { ...options, headers: headerBag, signal: controller.signal });
   } finally {
     clearTimeout(timeoutId);
   }
@@ -195,7 +211,7 @@ async function resolveOllamaModel(forceRefresh = false) {
   }
 
   modelResolvePromise = (async () => {
-    const healthCheck = await fetchWithTimeout(process.env.OLLAMA_BASE_URL + '/api/tags');
+    const healthCheck = await fetchWithTimeout(OLLAMA_BASE_URL + '/api/tags');
     if (!healthCheck.ok) throw new Error('Ollama not accessible');
 
     const modelsData = await healthCheck.json();
@@ -846,7 +862,7 @@ async function warmModel() {
     console.log('Warmed model:', warmedModel);
     
     // Quick warmup
-    await fetchWithTimeout(process.env.OLLAMA_BASE_URL + '/api/generate', {
+    await fetchWithTimeout(OLLAMA_BASE_URL + '/api/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -999,7 +1015,7 @@ async function convertCode(code, sourceLanguage, targetLanguage) {
     
       const estimatedPredict = estimatePredictTokens(normalizedCode, source, target);
 
-      const response = await fetchWithTimeout(process.env.OLLAMA_BASE_URL + '/api/generate', {
+      const response = await fetchWithTimeout(OLLAMA_BASE_URL + '/api/generate', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({

@@ -15,9 +15,13 @@ const PORT = process.env.PORT || 6001;
 const JSON_LIMIT = process.env.JSON_LIMIT || '1mb';
 const RATE_LIMIT_WINDOW_MS = Number(process.env.RATE_LIMIT_WINDOW_MS || 60_000);
 const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 60);
+function normalizeOrigin(value) {
+  return (value || '').trim().replace(/\/+$/, '').toLowerCase();
+}
+
 const ALLOWED_ORIGINS = (process.env.CORS_ORIGINS || '')
   .split(',')
-  .map((s) => s.trim())
+  .map((s) => normalizeOrigin(s))
   .filter(Boolean);
 
 app.use(
@@ -25,7 +29,8 @@ app.use(
     ALLOWED_ORIGINS.length
       ? {
           origin(origin, callback) {
-            if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+            const normalizedOrigin = normalizeOrigin(origin);
+            if (!origin || ALLOWED_ORIGINS.includes(normalizedOrigin)) {
               callback(null, true);
               return;
             }
