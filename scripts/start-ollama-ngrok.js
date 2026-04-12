@@ -15,6 +15,7 @@ const path = require('path');
 const { spawn } = require('child_process');
 
 const OLLAMA_PORT = 11434;
+const OLLAMA_PROXY_PORT = 11500;
 const NGROK_API_PORT = 4040;
 const BACKEND_PORT = Number(process.env.PORT || 6001);
 const HOST = '127.0.0.1';
@@ -95,6 +96,11 @@ async function isOllamaHealthy() {
   return !!(data && typeof data === 'object');
 }
 
+async function isOllamaProxyHealthy() {
+  const data = await fetchJsonWithTimeout(`http://${HOST}:${OLLAMA_PROXY_PORT}/api/tags`, 2000);
+  return !!(data && typeof data === 'object');
+}
+
 async function isBackendHealthy() {
   const data = await fetchJsonWithTimeout(`http://${HOST}:${BACKEND_PORT}/health`, 2000);
   return !!(data && typeof data === 'object' && data.status === 'OK');
@@ -151,7 +157,13 @@ async function ensureOllamaRunning() {
     shell: true,
     windowsHide: true,
     detached: true,
-    stdio: 'ignore'
+    stdio: 'ignore',
+    env: {
+      ...process.env,
+      OLLAMA_HOST: process.env.OLLAMA_HOST || `0.0.0.0:${OLLAMA_PORT}`,
+      OLLAMA_ORIGINS: process.env.OLLAMA_ORIGINS || '*',
+      OLLAMA_NO_CLOUD: process.env.OLLAMA_NO_CLOUD || '1'
+    }
   });
   child.unref();
 
@@ -159,23 +171,54 @@ async function ensureOllamaRunning() {
   log('Ollama server is running.');
 }
 
-async function getNgrokUrlForOllamaPort() {
+async function ensureOllamaProxyRunning() {
+  const portBusy = await isPortInUse(OLLAMA_PROXY_PORT);
+
+  if (portBusy) {
+    if (await isOllamaProxyHealthy()) {
+      log(`Ollama proxy is already running on port ${OLLAMA_PROXY_PORT}.`);
+      return;
+    }
+    throw new Error(`Port ${OLLAMA_PROXY_PORT} is in use by another process.`);
+  }
+
+  log(`Starting Ollama proxy bridge on port ${OLLAMA_PROXY_PORT}...`);
+  const proxyScript = path.join(PROJECT_ROOT, 'scripts', 'ollamaProxy.js');
+  const child = spawn('node', [proxyScript], {
+    shell: true,
+    windowsHide: true,
+    detached: true,
+    stdio: 'ignore',
+    env: {
+      ...process.env,
+      OLLAMA_PROXY_PORT: String(OLLAMA_PROXY_PORT),
+      OLLAMA_TARGET_HOST: HOST,
+      OLLAMA_TARGET_PORT: String(OLLAMA_PORT)
+    }
+  });
+  child.unref();
+
+  await waitFor(isOllamaProxyHealthy, 15000, 500, 'Ollama proxy startup');
+  log('Ollama proxy bridge is running.');
+}
+
+async function getNgrokUrlForPort(port) {
   const data = await fetchJsonWithTimeout(`http://${HOST}:${NGROK_API_PORT}/api/tunnels`, 2000);
   if (!data || !Array.isArray(data.tunnels)) return null;
 
   const matched = data.tunnels.find((tunnel) => {
     const publicUrl = tunnel.public_url || '';
     const addr = String(tunnel?.config?.addr || '');
-    return publicUrl.startsWith('https://') && addr.includes(String(OLLAMA_PORT));
+    return publicUrl.startsWith('https://') && addr.includes(String(port));
   });
 
   return matched ? matched.public_url : null;
 }
 
-async function ensureNgrokRunning() {
-  const existingUrl = await getNgrokUrlForOllamaPort();
+async function ensureNgrokRunning(targetPort) {
+  const existingUrl = await getNgrokUrlForPort(targetPort);
   if (existingUrl) {
-    log('Found existing ngrok tunnel for Ollama port.');
+    log(`Found existing ngrok tunnel for port ${targetPort}.`);
     return existingUrl;
   }
 
@@ -190,7 +233,7 @@ async function ensureNgrokRunning() {
     : null;
 
   let ngrokCommand = process.env.NGROK_PATH || autoNgrokPath || 'ngrok';
-  let ngrokArgs = ['http', String(OLLAMA_PORT)];
+  let ngrokArgs = ['http', String(targetPort)];
 
   const hasNgrok = process.env.NGROK_PATH
     ? fs.existsSync(process.env.NGROK_PATH)
@@ -202,11 +245,11 @@ async function ensureNgrokRunning() {
       throw new Error('Neither ngrok nor npx is available in PATH.');
     }
     ngrokCommand = 'npx';
-    ngrokArgs = ['ngrok', 'http', String(OLLAMA_PORT)];
+    ngrokArgs = ['ngrok', 'http', String(targetPort)];
     log('ngrok not found globally; using npx ngrok fallback.');
   }
 
-  log('Starting ngrok for port 11434...');
+  log(`Starting ngrok for port ${targetPort}...`);
   const child = spawn(ngrokCommand, ngrokArgs, {
     shell: true,
     windowsHide: true,
@@ -216,13 +259,13 @@ async function ensureNgrokRunning() {
   child.unref();
 
   await waitFor(
-    async () => !!(await getNgrokUrlForOllamaPort()),
+    async () => !!(await getNgrokUrlForPort(targetPort)),
     30000,
     1000,
     'ngrok startup'
   );
 
-  const ngrokUrl = await getNgrokUrlForOllamaPort();
+  const ngrokUrl = await getNgrokUrlForPort(targetPort);
   if (!ngrokUrl) {
     throw new Error('ngrok started but no HTTPS tunnel URL was found.');
   }
@@ -284,9 +327,13 @@ async function main() {
   log('Checking Ollama state...');
   await ensureOllamaRunning();
 
-  log('Checking ngrok tunnel...');
-  const ngrokUrl = await ensureNgrokRunning();
+  log('Checking Ollama proxy bridge...');
+  await ensureOllamaProxyRunning();
 
+  log('Checking ngrok tunnel...');
+  const ngrokUrl = await ensureNgrokRunning(OLLAMA_PROXY_PORT);
+
+  upsertEnvVar(ENV_PATH, 'OLLAMA_BASE_URL', ngrokUrl);
   upsertEnvVar(ENV_PATH, 'OLLAMA_API_URL', ngrokUrl);
 
   if (SHOULD_START_BACKEND) {
@@ -295,7 +342,7 @@ async function main() {
 
   console.log('\nOllama ngrok URL:');
   console.log(ngrokUrl);
-  console.log(`\nSaved to ${ENV_PATH} as OLLAMA_API_URL`);
+  console.log(`\nSaved to ${ENV_PATH} as OLLAMA_BASE_URL and OLLAMA_API_URL`);
   if (SHOULD_START_BACKEND) {
     console.log(`Backend is up at http://${HOST}:${BACKEND_PORT}`);
   }

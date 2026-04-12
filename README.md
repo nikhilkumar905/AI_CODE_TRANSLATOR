@@ -71,7 +71,25 @@ npm --prefix frontend run dev -- --port 6002
 
 # Start only perf checker
 npm --prefix perf-checker run dev
+
+# Start Ollama + proxy bridge + ngrok tunnel (one command)
+npm run start:ollama-tunnel
+
+# Same as above, plus backend API start
+npm run start:public-local
 ```
+
+### Public Ollama Tunnel (Recommended)
+
+`start:ollama-tunnel` now starts a local proxy bridge (`127.0.0.1:11500`) and tunnels that port through ngrok.
+This avoids the `models: []` behavior seen on some direct Ollama ngrok tunnels.
+
+After running, the script writes both of these into project `.env`:
+
+- `OLLAMA_BASE_URL=<https ngrok url>`
+- `OLLAMA_API_URL=<https ngrok url>`
+
+Use `OLLAMA_BASE_URL` in Render backend environment variables.
 
 ## Verification Checklist
 
