@@ -17,6 +17,7 @@ const TRAINED_MODEL_WORKER_IDLE_MS = Number(process.env.TRAINED_MODEL_WORKER_IDL
 const TRAINED_MODEL_PERSISTENT = process.env.TRAINED_MODEL_PERSISTENT !== '0';
 const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || '15m';
 const OLLAMA_MODEL_REFRESH_MS = Number(process.env.OLLAMA_MODEL_REFRESH_MS || 300000);
+const OLLAMA_MODEL = (process.env.OLLAMA_MODEL || '').trim();
 
 function resolveOllamaBaseUrl() {
   let base = (process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434').trim().replace(/\/+$/, '');
@@ -201,6 +202,12 @@ function estimatePredictTokens(code, source, target) {
 }
 
 async function resolveOllamaModel(forceRefresh = false) {
+  if (OLLAMA_MODEL) {
+    warmedModel = OLLAMA_MODEL;
+    modelCacheExpiresAt = Date.now() + OLLAMA_MODEL_REFRESH_MS;
+    return warmedModel;
+  }
+
   const now = Date.now();
   if (!forceRefresh && warmedModel && now < modelCacheExpiresAt) {
     return warmedModel;
