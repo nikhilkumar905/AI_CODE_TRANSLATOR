@@ -20,11 +20,7 @@ const OLLAMA_MODEL_REFRESH_MS = Number(process.env.OLLAMA_MODEL_REFRESH_MS || 30
 const OLLAMA_MODEL = (process.env.OLLAMA_MODEL || '').trim();
 
 function resolveOllamaBaseUrl() {
-  let base = (process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434').trim().replace(/\/+$/, '');
-  if (/^http:\/\/.+ngrok-free\.(app|dev)$/i.test(base)) {
-    base = `https://${base.slice('http://'.length)}`;
-  }
-  return base;
+  return (process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434').trim().replace(/\/+$/, '');
 }
 
 const OLLAMA_BASE_URL = resolveOllamaBaseUrl();
@@ -172,19 +168,71 @@ function cacheSet(key, value) {
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = OLLAMA_TIMEOUT_MS) {
-  const hostLooksLikeNgrok = /ngrok(-free)?\.(app|dev|io)/i.test(url);
-  const headerBag = { ...(options.headers || {}) };
-  if (hostLooksLikeNgrok && !headerBag['ngrok-skip-browser-warning']) {
-    headerBag['ngrok-skip-browser-warning'] = 'true';
-  }
-
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    return await fetch(url, { ...options, headers: headerBag, signal: controller.signal });
+    return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+async function generateWithOllama(prompt, model, estimatedPredict) {
+  // Prefer classic Ollama endpoint.
+  const generateResponse = await fetchWithTimeout(OLLAMA_BASE_URL + '/api/generate', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model,
+      prompt,
+      stream: false,
+      keep_alive: OLLAMA_KEEP_ALIVE,
+      options: {
+        temperature: 0.0,
+        num_predict: estimatedPredict,
+        top_p: 0.9,
+        repeat_penalty: 1.05,
+        num_ctx: 2048,
+        num_batch: 8
+      }
+    })
+  });
+
+  if (generateResponse.ok) {
+    const data = await generateResponse.json();
+    if (!data.response) {
+      throw new Error('Invalid response');
+    }
+    return data.response;
+  }
+
+  // Some local Ollama setups expose only OpenAI-compatible endpoints.
+  if (generateResponse.status === 404) {
+    const chatResponse = await fetchWithTimeout(OLLAMA_BASE_URL + '/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model,
+        messages: [{ role: 'user', content: prompt }],
+        temperature: 0.0,
+        max_tokens: estimatedPredict,
+        stream: false
+      })
+    });
+
+    if (!chatResponse.ok) {
+      throw new Error(`Ollama error: ${chatResponse.status}`);
+    }
+
+    const data = await chatResponse.json();
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content || typeof content !== 'string') {
+      throw new Error('Invalid chat response');
+    }
+    return content;
+  }
+
+  throw new Error(`Ollama error: ${generateResponse.status}`);
 }
 
 function estimatePredictTokens(code, source, target) {
@@ -830,17 +878,7 @@ async function warmModel() {
     console.log('Warmed model:', warmedModel);
     
     // Quick warmup
-    await fetchWithTimeout(OLLAMA_BASE_URL + '/api/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: warmedModel,
-        prompt: '1+1',
-        stream: false,
-        keep_alive: OLLAMA_KEEP_ALIVE,
-        options: { num_predict: 5 }
-      })
-    });
+    await generateWithOllama('1+1', warmedModel, 5);
   } catch (err) {
     console.log('Warm-up failed:', err.message);
   }
@@ -983,33 +1021,9 @@ async function convertCode(code, sourceLanguage, targetLanguage) {
     
       const estimatedPredict = estimatePredictTokens(normalizedCode, source, target);
 
-      const response = await fetchWithTimeout(OLLAMA_BASE_URL + '/api/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: model,
-        prompt: prompt,
-        stream: false,
-          keep_alive: OLLAMA_KEEP_ALIVE,
-          options: {
-            temperature: 0.0,
-            num_predict: estimatedPredict,
-            top_p: 0.9,
-            repeat_penalty: 1.05,
-            num_ctx: 2048,
-            num_batch: 8
-          }
-      })
-      });
+      const rawResponse = await generateWithOllama(prompt, model, estimatedPredict);
 
-      if (!response.ok) {
-        throw new Error(`Ollama error: ${response.status}`);
-      }
-
-      const data = await response.json();
-      if (!data.response) throw new Error('Invalid response');
-
-      let convertedCode = extractCode(data.response).trim();
+      let convertedCode = extractCode(rawResponse).trim();
 
       if (target === 'java') {
         convertedCode = trimToBalancedJavaCode(convertedCode);

@@ -71,25 +71,20 @@ npm --prefix frontend run dev -- --port 6002
 
 # Start only perf checker
 npm --prefix perf-checker run dev
-
-# Start Ollama + proxy bridge + ngrok tunnel (one command)
-npm run start:ollama-tunnel
-
-# Same as above, plus backend API start
-npm run start:public-local
 ```
 
-### Public Ollama Tunnel (Recommended)
+### Localhost Mode (Default)
 
-`start:ollama-tunnel` now starts a local proxy bridge (`127.0.0.1:11500`) and tunnels that port through ngrok.
-This avoids the `models: []` behavior seen on some direct Ollama ngrok tunnels.
+This project now runs in localhost-only mode for Ollama during local development:
 
-After running, the script writes both of these into project `.env`:
+- `OLLAMA_BASE_URL=http://127.0.0.1:11434`
+- `OLLAMA_MODEL=codellama:latest`
 
-- `OLLAMA_BASE_URL=<https ngrok url>`
-- `OLLAMA_API_URL=<https ngrok url>`
+Start Ollama in a separate terminal before starting backend:
 
-Use `OLLAMA_BASE_URL` in Render backend environment variables.
+```powershell
+ollama serve
+```
 
 ## Verification Checklist
 
@@ -106,7 +101,8 @@ If `start:all` fails because one port is already in use, stop the existing proce
 2. In Render, create a new Blueprint and point it to this repo.
 3. Render will detect `render.yaml` and create the backend service.
 4. In Render service environment variables, set:
-	- `OLLAMA_BASE_URL` to your reachable Ollama endpoint.
+	- `OLLAMA_BASE_URL` to your deployed Ollama endpoint (not localhost).
+	- `OLLAMA_MODEL` to your deployed model name (for example `codellama:latest`).
 	- `CORS_ORIGINS` to your Vercel frontend URL.
 	- Optional Python/model paths (`PYTHON_EXECUTABLE`, `TRAINED_MODEL_PATH`) if you want Python<->C++ local model path explicitly configured.
 5. Deploy and verify:
