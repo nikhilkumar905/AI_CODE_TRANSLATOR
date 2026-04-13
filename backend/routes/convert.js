@@ -1,7 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const { convertCode } = require('../services/ollamaService');
-const CONVERT_TIMEOUT_MS = Number(process.env.CONVERT_TIMEOUT_MS || 45000);
+const CONVERT_TIMEOUT_MS = Number(process.env.CONVERT_TIMEOUT_MS || 240000);
 
 router.post('/', async (req, res) => {
   try {
@@ -62,7 +62,9 @@ router.post('/', async (req, res) => {
     }
 
     if (!result.success) {
-      return res.status(500).json({ ...result, requestId: req.requestId });
+      const isOllamaUnavailable = result.errorCode === 'OLLAMA_NOT_AVAILABLE';
+      const status = isOllamaUnavailable ? 503 : 500;
+      return res.status(status).json({ ...result, requestId: req.requestId });
     }
 
     res.json({

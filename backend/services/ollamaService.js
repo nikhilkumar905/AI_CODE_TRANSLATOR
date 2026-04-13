@@ -11,8 +11,8 @@ const LANGUAGE_MAP = {
 
 const { spawn } = require('child_process');
 const path = require('path');
-const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS || 30000);
-const TRAINED_MODEL_TIMEOUT_MS = Number(process.env.TRAINED_MODEL_TIMEOUT_MS || 60000);
+const OLLAMA_TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS || 45000);
+const TRAINED_MODEL_TIMEOUT_MS = Number(process.env.TRAINED_MODEL_TIMEOUT_MS || 240000);
 const TRAINED_MODEL_WORKER_IDLE_MS = Number(process.env.TRAINED_MODEL_WORKER_IDLE_MS || 120000);
 const TRAINED_MODEL_PERSISTENT = process.env.TRAINED_MODEL_PERSISTENT !== '0';
 const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || '15m';
@@ -24,6 +24,29 @@ function resolveOllamaBaseUrl() {
 }
 
 const OLLAMA_BASE_URL = resolveOllamaBaseUrl();
+
+function buildOllamaUnavailableResult(details) {
+  return {
+    success: false,
+    errorCode: 'OLLAMA_NOT_AVAILABLE',
+    error: 'Ollama is not available on this server. Download and run Ollama first, then try again.',
+    details
+  };
+}
+
+function isOllamaUnavailableError(err) {
+  const msg = (err && err.message ? err.message : String(err || '')).toLowerCase();
+  return (
+    msg.includes('failed to fetch') ||
+    msg.includes('econnrefused') ||
+    msg.includes('connect') ||
+    msg.includes('ollama not accessible') ||
+    msg.includes('no models available') ||
+    msg.includes('ollama error: 404') ||
+    msg.includes('ollama error: 500') ||
+    msg.includes('aborterror')
+  );
+}
 
 // Cache for repeated conversions
 const conversionCache = new Map();
@@ -1050,6 +1073,10 @@ async function convertCode(code, sourceLanguage, targetLanguage) {
         conversionTime: `${duration}s`
       };
     } catch (error) {
+      if (isOllamaUnavailableError(error)) {
+        return buildOllamaUnavailableResult(error.message);
+      }
+
       return {
         success: false,
         error: error.message

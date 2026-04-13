@@ -33,7 +33,9 @@ function useCodeConversion() {
       return {
         success: true,
         convertedCode: data.convertedCode,
-        detectedLanguage: data.detectedLanguage
+        detectedLanguage: data.detectedLanguage,
+        provider: data.provider,
+        conversionTime: data.conversionTime
       };
     } catch (err) {
       setError(err.message);
