@@ -17,6 +17,7 @@ const TRAINED_MODEL_WORKER_IDLE_MS = Number(process.env.TRAINED_MODEL_WORKER_IDL
 const TRAINED_MODEL_PERSISTENT = process.env.TRAINED_MODEL_PERSISTENT !== '0';
 const OLLAMA_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || '15m';
 const OLLAMA_MODEL_REFRESH_MS = Number(process.env.OLLAMA_MODEL_REFRESH_MS || 300000);
+const OLLAMA_MAX_TIMEOUT_MS = Number(process.env.OLLAMA_MAX_TIMEOUT_MS || 360000);
 const OLLAMA_MODEL = (process.env.OLLAMA_MODEL || '').trim();
 
 function resolveOllamaBaseUrl() {
@@ -38,6 +39,7 @@ function isOllamaUnavailableError(err) {
   const msg = (err && err.message ? err.message : String(err || '')).toLowerCase();
   return (
     msg.includes('failed to fetch') ||
+    msg.includes('fetch failed') ||
     msg.includes('econnrefused') ||
     msg.includes('connect') ||
     msg.includes('ollama not accessible') ||
@@ -52,6 +54,7 @@ function isOllamaUnavailableError(err) {
 const conversionCache = new Map();
 const CACHE_TTL = 300000; // 5 minutes
 const MAX_CACHE_ENTRIES = 200;
+const CACHE_SCHEMA_VERSION = 'v11';
 const inFlightConversions = new Map();
 
 const perfMetrics = {
@@ -195,12 +198,26 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = OLLAMA_TIMEOUT_MS
   const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, { ...options, signal: controller.signal });
+  } catch (error) {
+    if (error && error.name === 'AbortError') {
+      throw new Error(`Ollama request timed out after ${timeoutMs}ms`);
+    }
+    throw error;
   } finally {
     clearTimeout(timeoutId);
   }
 }
 
+function computeOllamaTimeoutMs(prompt, estimatedPredict) {
+  const byPromptSize = Math.ceil((prompt.length || 0) * 2.2);
+  const byOutputSize = Math.ceil((estimatedPredict || 0) * 220);
+  const dynamicTimeout = Math.max(OLLAMA_TIMEOUT_MS, 60000 + byPromptSize + byOutputSize);
+  return Math.min(OLLAMA_MAX_TIMEOUT_MS, dynamicTimeout);
+}
+
 async function generateWithOllama(prompt, model, estimatedPredict) {
+  const requestTimeoutMs = computeOllamaTimeoutMs(prompt, estimatedPredict);
+
   // Prefer classic Ollama endpoint.
   const generateResponse = await fetchWithTimeout(OLLAMA_BASE_URL + '/api/generate', {
     method: 'POST',
@@ -219,7 +236,7 @@ async function generateWithOllama(prompt, model, estimatedPredict) {
         num_batch: 8
       }
     })
-  });
+  }, requestTimeoutMs);
 
   if (generateResponse.ok) {
     const data = await generateResponse.json();
@@ -241,7 +258,7 @@ async function generateWithOllama(prompt, model, estimatedPredict) {
         max_tokens: estimatedPredict,
         stream: false
       })
-    });
+    }, requestTimeoutMs);
 
     if (!chatResponse.ok) {
       throw new Error(`Ollama error: ${chatResponse.status}`);
@@ -312,6 +329,35 @@ function normalizeLanguage(lang) {
   return LANGUAGE_MAP[lang.toLowerCase().trim()] || lang;
 }
 
+function detectSourceLanguageFromCode(code) {
+  const sample = String(code || '');
+
+  const cppSignals = [
+    /#include\s*</,
+    /\busing\s+namespace\s+std\b/,
+    /\bstd::/,
+    /->/,
+    /\bcout\s*<</,
+    /\bint\s+main\s*\(/,
+    /;\s*$/m
+  ];
+
+  const pythonSignals = [
+    /^\s*def\s+\w+\s*\(/m,
+    /^\s*class\s+\w+\s*:/m,
+    /^\s*import\s+\w+/m,
+    /\bself\./,
+    /print\s*\(/
+  ];
+
+  const cppScore = cppSignals.reduce((score, rule) => score + (rule.test(sample) ? 1 : 0), 0);
+  const pyScore = pythonSignals.reduce((score, rule) => score + (rule.test(sample) ? 1 : 0), 0);
+
+  if (cppScore >= 2 && cppScore >= pyScore) return 'cpp';
+  if (pyScore >= 2 && pyScore > cppScore) return 'python';
+  return 'auto';
+}
+
 function buildPrompt(code, sourceLanguage, targetLanguage) {
   const source = sourceLanguage === 'auto' ? 'source' : normalizeLanguage(sourceLanguage);
   const target = normalizeLanguage(targetLanguage);
@@ -351,255 +397,266 @@ function extractCode(text) {
 function trimToBalancedJavaCode(text) {
   if (!text) return '';
   const src = text.replace(/\r\n/g, '\n');
-  const classIdx = src.search(/\b(class|public\s+class)\b/);
-  if (classIdx < 0) return src.trim();
+  const javaStartIdx = src.search(/^\s*(package\s+.+;|import\s+.+;|public\s+class\s+\w+\s*\{|class\s+\w+\s*\{|public\s+interface\s+\w+\s*\{|interface\s+\w+\s*\{|public\s+enum\s+\w+\s*\{|enum\s+\w+\s*\{)/m);
+  if (javaStartIdx < 0) return src.trim();
+  return src.slice(javaStartIdx).trim();
+}
 
-  const pre = src.slice(0, classIdx);
-  const imports = pre
-    .split('\n')
-    .map((l) => l.trimEnd())
-    .filter((l) => /^\s*(import\s+.+;|package\s+.+;)\s*$/.test(l));
+function trimForeignTailForJava(text) {
+  if (!text) return '';
+  const markers = [
+    /^\s*class\s+\w+\s*:\s*$/m,
+    /^\s*def\s+\w+\s*\(/m,
+    /^\s*if\s+__name__\s*==\s*["']__main__["']\s*:/m,
+    /^\s*import\s+[a-zA-Z_][a-zA-Z0-9_]*\s*$/m
+  ];
 
-  const body = src.slice(classIdx);
-  let depth = 0;
-  let started = false;
-  let endPos = -1;
-  for (let i = 0; i < body.length; i++) {
-    const ch = body[i];
-    if (ch === '{') {
-      depth += 1;
-      started = true;
-    } else if (ch === '}') {
-      if (depth > 0) depth -= 1;
-      if (started && depth === 0) {
-        endPos = i;
-        break;
-      }
+  let cutAt = -1;
+  for (const marker of markers) {
+    const match = marker.exec(text);
+    if (match && match.index > 0) {
+      cutAt = cutAt < 0 ? match.index : Math.min(cutAt, match.index);
     }
   }
 
-  const classBlock = endPos >= 0 ? body.slice(0, endPos + 1) : body;
-  const prefix = imports.length ? `${imports.join('\n')}\n\n` : '';
-  return `${prefix}${classBlock}`.trim();
+  return cutAt >= 0 ? text.slice(0, cutAt).trim() : text.trim();
 }
 
-function convertJavaHttpToCppSimple(code) {
-  const urlMatch = code.match(/new\s+URL\s*\(\s*"([^"]+)"\s*\)/);
-  const directUrl = urlMatch ? urlMatch[1] : null;
+function trimForeignTailForPython(text) {
+  if (!text) return '';
+  const markers = [
+    /^\s*import\s+java\.[^\n]+$/m,
+    /^\s*public\s+class\s+\w+\s*\{/m,
+    /^\s*class\s+\w+\s*\{\s*$/m,
+    /^\s*public\s+static\s+void\s+main\s*\(/m,
+    /#include\s*</,
+    /^\s*using\s+namespace\s+\w+\s*;/m,
+    /^\s*(?:int|void|double|float|bool|string|char)\s+main\s*\(/m
+  ];
 
-  const stringUrlMatch = code.match(/String\s+url\s*=\s*"([^"]+)"\s*;/);
-  const fallbackUrl = stringUrlMatch ? stringUrlMatch[1] : null;
-
-  const url = directUrl || fallbackUrl || 'https://jsonplaceholder.typicode.com/posts/1';
-
-  return `#include <iostream>
-#include <string>
-#include <curl/curl.h>
-
-using namespace std;
-
-size_t writeCallback(void* contents, size_t size, size_t nmemb, string* output) {
-    size_t totalSize = size * nmemb;
-    output->append(static_cast<char*>(contents), totalSize);
-    return totalSize;
-}
-
-int main() {
-    CURL* curl = curl_easy_init();
-    CURLcode res;
-    string response;
-
-    if (curl) {
-        curl_easy_setopt(curl, CURLOPT_URL, "${url}");
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, writeCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-
-        res = curl_easy_perform(curl);
-
-        if (res != CURLE_OK) {
-            cout << "Error: " << curl_easy_strerror(res) << endl;
-        } else {
-            cout << "Response:" << endl;
-            cout << response << endl;
-        }
-
-        curl_easy_cleanup(curl);
+  let cutAt = -1;
+  for (const marker of markers) {
+    const match = marker.exec(text);
+    if (match && match.index > 0) {
+      cutAt = cutAt < 0 ? match.index : Math.min(cutAt, match.index);
     }
+  }
 
-    return 0;
-}`;
+  return cutAt >= 0 ? text.slice(0, cutAt).trim() : text.trim();
 }
 
-function isJavaHttpGetPattern(code) {
-  return /new\s+URL\s*\(/.test(code) && /openStream\s*\(/.test(code);
+function trimLeadingNonPythonForPythonTarget(text) {
+  if (!text) return '';
+  const startMarker = /^\s*(from\s+\w+\s+import\s+\w+|import\s+\w+|class\s+\w+\s*:|def\s+\w+\s*\(|if\s+__name__\s*==\s*["']__main__["']\s*:)/m;
+  const match = startMarker.exec(text);
+  if (match && match.index > 0) {
+    return text.slice(match.index).trim();
+  }
+  return text.trim();
 }
 
-function convertCppToJavaSimple(code) {
-  const lines = code.split('\n');
+function stripInterleavedCppFromPython(text) {
+  if (!text) return '';
 
-  const typeMap = {
-    bool: 'boolean',
-    void: 'void',
-    int: 'int',
-    double: 'double',
-    float: 'float',
-    string: 'String',
-    char: 'char'
-  };
+  const lines = text.replace(/\r\n/g, '\n').split('\n');
+  const filtered = [];
 
-  function convertParams(params) {
-    const p = params.trim();
-    if (!p) return '';
-    return p
-      .split(',')
-      .map((part) => part.trim().replace(/\s+/g, ' '))
-      .map((part) => {
-        const m = part.match(/^(int|bool|double|float|string|char|auto)\s+(.+)$/i);
-        if (!m) return part;
-        const t = (typeMap[m[1].toLowerCase()] || m[1]);
-        return `${t} ${m[2].trim()}`;
-      })
-      .join(', ');
-  }
-
-  function convertCout(line) {
-    const t = line.trim();
-    if (!t.startsWith('cout <<')) return line;
-
-    const isPrintln = /<<\s*endl\s*;\s*$/.test(t);
-    let expr = t.replace(/^cout\s*<<\s*/, '').replace(/;\s*$/, '');
-    expr = expr.replace(/<<\s*endl\s*$/,'').trim();
-    const parts = expr.split('<<').map((s) => s.trim()).filter(Boolean);
-    const joined = parts.join(' + ');
-    return isPrintln
-      ? line.replace(/cout\s*<<[\s\S]*;\s*$/, `System.out.println(${joined});`)
-      : line.replace(/cout\s*<<[\s\S]*;\s*$/, `System.out.print(${joined});`);
-  }
-
-  function convertGlobalExpr(expr) {
-    let out = expr.trim();
-    out = out.replace(/\btrue\b/g, 'true').replace(/\bfalse\b/g, 'false');
-    return out;
-  }
-
-  // Parse top-level global fields only (brace depth = 0).
-  const fieldDecls = [];
-  let depth = 0;
   for (const raw of lines) {
-    const line = raw.trim();
-    if (!line) {
-      depth += (raw.match(/\{/g) || []).length;
-      depth -= (raw.match(/\}/g) || []).length;
+    const line = raw;
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      filtered.push('');
       continue;
     }
 
-    if (depth === 0) {
-      const vec2 = line.match(/^vector\s*<\s*vector\s*<\s*int\s*>\s*>\s+(\w+)\s*\(\s*([^,]+)\s*,\s*vector\s*<\s*int\s*>\s*\(\s*([^,\)]+)\s*,\s*[^\)]+\)\s*\)\s*;$/);
-      if (vec2) {
-        const name = vec2[1];
-        const rows = convertGlobalExpr(vec2[2]);
-        const cols = convertGlobalExpr(vec2[3]);
-        fieldDecls.push(`static int[][] ${name} = new int[${rows}][${cols}];`);
-      } else {
-        const simple = line.match(/^(int|bool|double|float|string|char)\s+(\w+)\s*=\s*(.+);$/i);
-        if (simple) {
-          const jType = typeMap[simple[1].toLowerCase()] || simple[1];
-          const name = simple[2];
-          const value = convertGlobalExpr(simple[3]);
-          fieldDecls.push(`static ${jType} ${name} = ${value};`);
-        }
-      }
+    // Drop obvious C/C++ artifacts that can leak into mixed responses.
+    if (
+      /^#include\s*</.test(trimmed) ||
+      /^using\s+namespace\s+\w+\s*;?$/.test(trimmed) ||
+      /^(?:public|private|protected)\s*:\s*$/.test(trimmed) ||
+      /^\{\s*$/.test(trimmed) ||
+      /^\}\s*;?\s*$/.test(trimmed) ||
+      /^int\s+main\s*\(/.test(trimmed) ||
+      /^\w+\s*::\s*\w+\s*\(/.test(trimmed)
+    ) {
+      continue;
     }
 
-    depth += (raw.match(/\{/g) || []).length;
-    depth -= (raw.match(/\}/g) || []).length;
-  }
-
-  function convertBodyLine(line, isMain) {
-    const indent = (line.match(/^\s*/) || [''])[0];
-    let t = line.trim();
-    if (!t) return line;
-
-    t = t.replace(/\bauto\s+(\w+)\s*=\s*/g, 'int $1 = ');
-    if (t.startsWith('return 0;') && isMain) return null;
-    if (t.startsWith('using namespace')) return null;
-    if (t.startsWith('#include')) return null;
-
-    const converted = convertCout(indent + t);
-    return converted;
-  }
-
-  // Parse top-level C++ functions.
-  const methods = [];
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i];
-    const m = line.trim().match(/^(bool|void|int|double|float|string|char)\s+(\w+)\(([^)]*)\)\s*\{\s*$/i);
-    if (!m) continue;
-
-    const retRaw = m[1].toLowerCase();
-    const name = m[2];
-    const params = convertParams(m[3]);
-
-    let braceDepth = 0;
-    const body = [];
-    for (; i < lines.length; i++) {
-      const cur = lines[i];
-      braceDepth += (cur.match(/\{/g) || []).length;
-      braceDepth -= (cur.match(/\}/g) || []).length;
-
-      if (cur !== line) body.push(cur);
-      if (braceDepth === 0) break;
+    // Drop C++-style function signatures while preserving Python def lines.
+    if (
+      /^(?:const\s+)?(?:unsigned\s+)?(?:long\s+)?(?:int|void|double|float|bool|string|char|auto)\s+\w+\s*\([^)]*\)\s*\{?\s*$/.test(trimmed)
+    ) {
+      continue;
     }
 
-    // Remove trailing closing brace line from body.
-    if (body.length > 0 && body[body.length - 1].trim() === '}') {
-      body.pop();
+    // Drop lines containing strongly C++-specific syntax/tokens.
+    if (
+      /(\bstd::|\bcin\b|\bcout\b|\bvector\s*<|->|\bendl\b)/.test(trimmed) ||
+      /;\s*$/.test(trimmed)
+    ) {
+      continue;
     }
 
-    methods.push({ retRaw, name, params, body });
+    filtered.push(line);
   }
 
-  const out = [];
-  out.push('import java.util.*;');
-  out.push('');
-  out.push('public class Main {');
-
-  for (const decl of fieldDecls) {
-    out.push(`    ${decl}`);
-  }
-  if (fieldDecls.length > 0) out.push('');
-
-  for (const method of methods) {
-    const isMain = method.name === 'main' && method.retRaw === 'int';
-    if (isMain) {
-      out.push('    public static void main(String[] args) {');
-    } else {
-      const ret = typeMap[method.retRaw] || method.retRaw;
-      out.push(`    static ${ret} ${method.name}(${method.params}) {`);
-    }
-
-    for (const b of method.body) {
-      const converted = convertBodyLine(b, isMain);
-      if (converted === null) continue;
-      out.push(`    ${converted}`);
-    }
-    out.push('    }');
-    out.push('');
-  }
-
-  out.push('}');
-  return out.join('\n');
+  const compact = filtered.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  return compact;
 }
 
-function isRuleBasedCppToJavaSafe(code) {
-  // Rule-based path handles simple algorithmic C++ only.
-  // For external/native APIs and pointer-heavy code, fall back to LLM.
-  if (/#include\s*<\s*curl\/curl\.h\s*>/i.test(code)) return false;
-  if (/\bCURL\s*\*/.test(code)) return false;
-  if (/\bCURLcode\b/.test(code)) return false;
-  if (/\bcurl_easy_\w+\s*\(/.test(code)) return false;
-  if (/\bvoid\s*\*/.test(code)) return false;
-  return true;
+function sanitizeConvertedOutput(text, target) {
+  const normalizedTarget = (target || '').toLowerCase();
+  let output = (text || '').trim();
+
+  if (normalizedTarget === 'java') {
+    output = trimToBalancedJavaCode(output);
+    output = trimForeignTailForJava(output);
+  } else if (normalizedTarget === 'python') {
+    output = trimLeadingNonPythonForPythonTarget(output);
+    output = stripInterleavedCppFromPython(output);
+    output = trimForeignTailForPython(output);
+    output = repairPythonFromCppArtifacts(output);
+  } else if (normalizedTarget === 'cpp') {
+    output = trimForeignTailForCpp(output);
+    output = repairCppFromPythonArtifacts(output);
+  }
+
+  return output;
+}
+
+function repairPythonFromCppArtifacts(text) {
+  let out = String(text || '');
+
+  // Common C++ STL idioms that occasionally leak into python output.
+  out = out.replace(
+    /\*\s*max_element\(\s*([A-Za-z_]\w*)\.begin\(\)\s*,\s*\1\.end\(\)\s*\)/g,
+    'max($1)'
+  );
+
+  // LeetCode-style integer binary search midpoint should stay integer.
+  out = out.replace(
+    /^([ \t]*mid\s*=\s*\([^\n]*left[^\n]*right[^\n]*\))\s*\/\s*2\s*$/gm,
+    '$1 // 2'
+  );
+
+  // Integer ceil-division pattern used in Koko/minEatingSpeed style code.
+  out = out.replace(
+    /^([ \t]*hours\s*\+=\s*\([^\n]*\))\s*\/\s*([A-Za-z_]\w+)\s*$/gm,
+    '$1 // $2'
+  );
+
+  out = out.replace(/\btrue\b/g, 'True').replace(/\bfalse\b/g, 'False');
+  return out;
+}
+
+function trimForeignTailForCpp(text) {
+  if (!text) return '';
+  const markers = [
+    /^\s*from\s+\w+\s+import\s+\w+/m,
+    /^\s*import\s+\w+/m,
+    /^\s*def\s+\w+\s*\(/m,
+    /^\s*if\s+__name__\s*==\s*["']__main__["']\s*:/m
+  ];
+
+  let cutAt = -1;
+  for (const marker of markers) {
+    const match = marker.exec(text);
+    if (match && match.index > 0) {
+      cutAt = cutAt < 0 ? match.index : Math.min(cutAt, match.index);
+    }
+  }
+
+  return cutAt >= 0 ? text.slice(0, cutAt).trim() : text.trim();
+}
+
+function repairCppFromPythonArtifacts(text) {
+  let out = String(text || '');
+  out = out.replace(/\bTrue\b/g, 'true').replace(/\bFalse\b/g, 'false');
+  return out;
+}
+
+function normalizePythonInputForModel(code) {
+  let out = String(code || '');
+
+  // Common typo in main guard: `if __name__ = "__main__":`
+  out = out.replace(
+    /^([ \t]*if[ \t]+__name__[ \t]*)=(?!=)([ \t]*["']__main__["'][ \t]*:)/gm,
+    '$1==$2'
+  );
+
+  return out;
+}
+
+function shouldRetryModelOutput(code, target) {
+  const output = String(code || '');
+  if (!output.trim()) return true;
+
+  const unsupportedMarkers = [
+    'Unsupported Python statement',
+    '/* unsupported_expr */'
+  ];
+
+  if (unsupportedMarkers.some((marker) => output.includes(marker))) {
+    return true;
+  }
+
+  if (target === 'python') {
+    const cppLeakMarkers = [
+      '#include <',
+      'using namespace std',
+      'int main(',
+      '*max_element(',
+      '.begin()',
+      '.end()'
+    ];
+    return cppLeakMarkers.some((marker) => output.includes(marker));
+  }
+
+  if (target === 'cpp') {
+    const pythonLeakMarkers = [
+      'def ',
+      'if __name__ == "__main__":',
+      'if __name__ == \"__main__\":',
+      'print(',
+      'deque('
+    ];
+    return pythonLeakMarkers.some((marker) => output.includes(marker));
+  }
+
+  return false;
+}
+
+async function callTrainedModelWithFallback(code, sourceLang, targetLang) {
+  const normalizedCode = sourceLang === 'python' ? normalizePythonInputForModel(code) : code;
+  let firstErr = null;
+
+  try {
+    const primary = await callTrainedModelService(normalizedCode, sourceLang, targetLang);
+    const cleanedPrimary = sanitizeConvertedOutput(primary.convertedCode, targetLang);
+    if (!shouldRetryModelOutput(cleanedPrimary, targetLang)) {
+      return {
+        success: true,
+        convertedCode: cleanedPrimary,
+        provider: primary.provider || 'Local Trained Model (Python<->C++)'
+      };
+    }
+  } catch (err) {
+    firstErr = err;
+  }
+
+  // Fallback: retry with one-shot process (still model-based, no Ollama fallback).
+  const retry = await callTrainedModelServiceOneShot(normalizedCode, sourceLang, targetLang);
+  const cleanedRetry = sanitizeConvertedOutput(retry.convertedCode, targetLang);
+  if (shouldRetryModelOutput(cleanedRetry, targetLang)) {
+    throw new Error(firstErr ? `Model fallback failed: ${firstErr.message}` : 'Model fallback failed: invalid conversion output');
+  }
+
+  return {
+    success: true,
+    convertedCode: cleanedRetry,
+    provider: `${retry.provider || 'Local Trained Model (Python<->C++)'} (Fallback)`
+  };
 }
 
 // Call local trained model service for Python<->C++ only
@@ -837,12 +894,7 @@ async function callTrainedModelService(code, sourceLang, targetLang) {
     return callTrainedModelServiceOneShot(code, sourceLang, targetLang);
   }
 
-  try {
-    return await callTrainedModelServicePersistent(code, sourceLang, targetLang);
-  } catch (err) {
-    console.warn(`Persistent trained model worker failed, falling back to one-shot: ${err.message}`);
-    return callTrainedModelServiceOneShot(code, sourceLang, targetLang);
-  }
+  return callTrainedModelServicePersistent(code, sourceLang, targetLang);
 }
 
 // Call Python Hugging Face service
@@ -912,8 +964,13 @@ warmModel();
 
 async function convertCode(code, sourceLanguage, targetLanguage) {
   const requestStart = Date.now();
-  const source = sourceLanguage.toLowerCase();
+  const requestedSource = sourceLanguage.toLowerCase();
+  const detectedSource = requestedSource === 'auto' ? detectSourceLanguageFromCode(code) : requestedSource;
+  const source = detectedSource;
   const target = targetLanguage.toLowerCase();
+  const inferredFromCode = detectSourceLanguageFromCode(code);
+  const looksLikeCpp = inferredFromCode === 'cpp';
+  const looksLikePython = inferredFromCode === 'python';
   const normalizedCode = normalizeCodeForCache(code);
   const pairKey = `${source}->${target}`;
 
@@ -933,7 +990,7 @@ async function convertCode(code, sourceLanguage, targetLanguage) {
   }
 
   // Cache key
-  const cacheKey = `${source}:${target}:${normalizedCode}`;
+  const cacheKey = `${CACHE_SCHEMA_VERSION}:${source}:${target}:${normalizedCode}`;
   const cached = conversionCache.get(cacheKey);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
     const cachedResult = {
@@ -959,12 +1016,34 @@ async function convertCode(code, sourceLanguage, targetLanguage) {
   const conversionPromise = (async () => {
   
     // Python <-> C++ is handled only by the trained local model
-    if ((source === 'python' && target === 'cpp') ||
-        (source === 'cpp' && target === 'python')) {
+    if (((source === 'python' || looksLikePython) && target === 'cpp') ||
+        ((source === 'cpp' || looksLikeCpp) && target === 'python')) {
       const startTime = Date.now();
+      const effectiveSource = (inferredFromCode === 'python' || inferredFromCode === 'cpp')
+        ? inferredFromCode
+        : source;
+
       try {
-        console.log('Using trained model converter for', source, '->', target);
-        const result = await callTrainedModelService(code, source, target);
+        // If code already matches target, avoid unnecessary conversion that can degrade output.
+        if (effectiveSource === target) {
+          const identityResult = {
+            success: true,
+            convertedCode: code,
+            provider: `Identity Converter (Detected ${effectiveSource})`,
+            conversionTime: '0.0s'
+          };
+
+          cacheSet(cacheKey, {
+            result: identityResult.convertedCode,
+            provider: identityResult.provider,
+            timestamp: Date.now()
+          });
+
+          return identityResult;
+        }
+
+        console.log('Using trained model converter for', effectiveSource, '->', target);
+        const result = await callTrainedModelWithFallback(code, effectiveSource, target);
 
         if (result.success) {
           cacheSet(cacheKey, {
@@ -984,57 +1063,13 @@ async function convertCode(code, sourceLanguage, targetLanguage) {
       } catch (err) {
         return {
           success: false,
-          error: err.message
+          error: err.message || 'Trained model conversion failed'
         };
       }
-
-      return {
-        success: false,
-        error: 'Trained model conversion failed'
-      };
     }
 
-    // Use deterministic conversion for C++ -> Java to avoid malformed LLM structures.
-    if (source === 'cpp' && target === 'java') {
-      if (isRuleBasedCppToJavaSafe(code)) {
-        try {
-          const convertedCode = convertCppToJavaSimple(code);
-          cacheSet(cacheKey, {
-            result: convertedCode,
-            provider: 'Rule-Based C++-Java Converter',
-            timestamp: Date.now()
-          });
-          return {
-            success: true,
-            convertedCode,
-            provider: 'Rule-Based C++-Java Converter',
-            conversionTime: '0.0s'
-          };
-        } catch (err) {
-          // Fall back to LLM path on unexpected parsing errors.
-          console.warn('Rule-based cpp->java fallback to LLM:', err.message);
-        }
-      }
-    }
-
-    // Deterministic reverse mapping for common Java URL/openStream HTTP code -> C++ libcurl.
-    if (source === 'java' && target === 'cpp' && isJavaHttpGetPattern(code)) {
-      const convertedCode = convertJavaHttpToCppSimple(code);
-      cacheSet(cacheKey, {
-        result: convertedCode,
-        provider: 'Rule-Based Java-C++ HTTP Converter',
-        timestamp: Date.now()
-      });
-      return {
-        success: true,
-        convertedCode,
-        provider: 'Rule-Based Java-C++ HTTP Converter',
-        conversionTime: '0.0s'
-      };
-    }
-  
-    // Use LLM for all other language pairs
-    const prompt = buildPrompt(code, sourceLanguage, targetLanguage);
+    // Use Ollama for all language pairs except Python<->C++.
+    const prompt = buildPrompt(code, source, targetLanguage);
 
     try {
       const startTime = Date.now();
@@ -1046,11 +1081,7 @@ async function convertCode(code, sourceLanguage, targetLanguage) {
 
       const rawResponse = await generateWithOllama(prompt, model, estimatedPredict);
 
-      let convertedCode = extractCode(rawResponse).trim();
-
-      if (target === 'java') {
-        convertedCode = trimToBalancedJavaCode(convertedCode);
-      }
+      let convertedCode = sanitizeConvertedOutput(extractCode(rawResponse), target);
 
       // Basic validation
       if (!convertedCode || convertedCode.length < 5) {

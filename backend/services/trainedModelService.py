@@ -117,6 +117,21 @@ class PyToCpp:
         if isinstance(node, ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id == "len" and len(node.args) == 1:
                 return f"{self.expr(node.args[0], ctx)}.size()"
+            if isinstance(node.func, ast.Name) and node.func.id == "input" and len(node.args) == 0:
+                return "([](){ string __s; cin >> __s; return __s; }())"
+            if (
+                isinstance(node.func, ast.Name)
+                and node.func.id == "int"
+                and len(node.args) == 1
+                and isinstance(node.args[0], ast.Call)
+                and isinstance(node.args[0].func, ast.Name)
+                and node.args[0].func.id == "input"
+                and len(node.args[0].args) == 0
+            ):
+                return "([](){ int __x; cin >> __x; return __x; }())"
+            if isinstance(node.func, ast.Name) and node.func.id == "max" and len(node.args) == 1:
+                seq = self.expr(node.args[0], ctx)
+                return f"*max_element({seq}.begin(), {seq}.end())"
             if isinstance(node.func, ast.Name) and node.func.id in self.class_names:
                 args = ", ".join(self.expr(a, ctx) for a in node.args)
                 return f"new {node.func.id}({args})"
@@ -134,7 +149,14 @@ class PyToCpp:
             op = op_map.get(type(node.ops[0]), "==")
             return f"({self.expr(node.left, ctx)} {op} {self.expr(node.comparators[0], ctx)})"
         if isinstance(node, ast.BinOp):
-            op_map = {ast.Add: "+", ast.Sub: "-", ast.Mult: "*", ast.Div: "/", ast.Mod: "%"}
+            op_map = {
+                ast.Add: "+",
+                ast.Sub: "-",
+                ast.Mult: "*",
+                ast.Div: "/",
+                ast.FloorDiv: "/",
+                ast.Mod: "%",
+            }
             op = op_map.get(type(node.op), "+")
             return f"({self.expr(node.left, ctx)} {op} {self.expr(node.right, ctx)})"
         if isinstance(node, ast.UnaryOp):
@@ -193,6 +215,23 @@ class PyToCpp:
                         ctx["decl"].add(name)
                         return
 
+                    # 1D list comp: [0 for _ in range(n)] -> vector<int> arr(n, 0)
+                    if (
+                        isinstance(comp.elt, ast.Constant)
+                        and len(comp.generators) == 1
+                        and isinstance(comp.generators[0].iter, ast.Call)
+                        and isinstance(comp.generators[0].iter.func, ast.Name)
+                        and comp.generators[0].iter.func.id == "range"
+                    ):
+                        _, size = self._range(comp.generators[0].iter, ctx)
+                        fill = self.expr(comp.elt, ctx)
+                        line = f"vector<int> {name}({size}, {fill});"
+                        if name in ctx["decl"]:
+                            line = f"{name} = vector<int>({size}, {fill});"
+                        self.emit(line, indent)
+                        ctx["decl"].add(name)
+                        return
+
                 rhs = self.expr(value, ctx)
                 if name in ctx["decl"]:
                     if isinstance(value, ast.Constant) and value.value is None and name in ctx["ptr"]:
@@ -223,7 +262,7 @@ class PyToCpp:
                 return
 
         if isinstance(node, ast.AugAssign):
-            op_map = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*=", ast.Div: "/="}
+            op_map = {ast.Add: "+=", ast.Sub: "-=", ast.Mult: "*=", ast.Div: "/=", ast.FloorDiv: "/="}
             op = op_map.get(type(node.op), "+=")
             self.emit(f"{self.expr(node.target, ctx)} {op} {self.expr(node.value, ctx)};", indent)
             return
@@ -390,7 +429,22 @@ class PyToCpp:
         name = self.function_name_map.get(fn.name, fn.name)
         ret = self.infer_return_type(fn)
         params = [a.arg for a in fn.args.args]
-        sig = ", ".join(f"int {p}" for p in params)
+
+        vector_like_params = set()
+        for n in ast.walk(fn):
+            if isinstance(n, ast.For) and isinstance(n.iter, ast.Name) and n.iter.id in params:
+                vector_like_params.add(n.iter.id)
+            if isinstance(n, ast.Subscript) and isinstance(n.value, ast.Name) and n.value.id in params:
+                vector_like_params.add(n.value.id)
+
+        sig_parts = []
+        for p in params:
+            if p in vector_like_params:
+                sig_parts.append(f"vector<int>& {p}")
+            else:
+                sig_parts.append(f"int {p}")
+        sig = ", ".join(sig_parts)
+
         self.emit(f"{ret} {name}({sig}) {{")
         ctx = {"decl": set(params), "ptr": set(), "class_name": None}
         for s in fn.body:
@@ -431,6 +485,7 @@ class PyToCpp:
         self.emit("#include <iostream>")
         self.emit("#include <vector>")
         self.emit("#include <string>")
+        self.emit("#include <algorithm>")
         self.emit("using namespace std;")
         self.emit("")
 
@@ -534,8 +589,14 @@ def convert_cpp_to_python_simple(code):
 
     def strip_cpp_type(var_decl):
         var_decl = var_decl.strip()
-        var_decl = re.sub(r"^(const\s+)?(unsigned\s+)?(long\s+)?(int|double|float|bool|string|char|auto|size_t|void)\s+", "", var_decl)
-        var_decl = re.sub(r"^[A-Za-z_]\w*\s*\*\s*", "", var_decl)
+        var_decl = var_decl.split("=", 1)[0].strip()
+        var_decl = re.sub(r"\s+", " ", var_decl)
+
+        # Extract the trailing identifier as the variable name, which works
+        # for declarations like `vector<int>& piles`, `Node* n`, etc.
+        m = re.search(r"([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*$", var_decl)
+        if m:
+            return m.group(1)
         return var_decl.strip()
 
     def emit_statement_line(py_line):
@@ -607,6 +668,17 @@ def convert_cpp_to_python_simple(code):
             cols = normalize_expr(vec_matrix_match.group(3))
             val = normalize_expr(vec_matrix_match.group(4))
             emit_statement_line(f"{name} = [[{val} for _ in range({cols})] for _ in range({rows})]")
+            continue
+
+        # 1D vector declaration: vector<int> piles(n);
+        vec_decl_match = re.match(
+            r"(?:std::)?vector\s*<\s*\w+\s*>\s+(\w+)\s*\(\s*([^\)]+)\s*\)\s*;",
+            line,
+        )
+        if vec_decl_match:
+            name = vec_decl_match.group(1)
+            size = normalize_expr(vec_decl_match.group(2))
+            emit_statement_line(f"{name} = [0 for _ in range({size})]")
             continue
 
         # Constructor
@@ -702,7 +774,10 @@ def convert_cpp_to_python_simple(code):
         # Complex dual-index C for-loops are intentionally kept as comments below
         # to avoid emitting malformed Python.
 
-        foreach_match = re.match(r"for\s*\(const\s+auto&\s+(\w+)\s*:\s*(.+)\)\s*\{?\s*$", line)
+        foreach_match = re.match(
+            r"for\s*\(\s*(?:const\s+)?(?:auto|[A-Za-z_]\w*(?:\s*<[^>]+>)?)\s*&?\s+(\w+)\s*:\s*(.+)\)\s*\{?\s*$",
+            line,
+        )
         if foreach_match:
             var = foreach_match.group(1)
             iterable = normalize_expr(foreach_match.group(2))
@@ -719,6 +794,18 @@ def convert_cpp_to_python_simple(code):
                 emit_statement_line(f"return {normalize_expr(val)}")
             else:
                 emit_statement_line("return")
+            continue
+
+        # cin input: cin >> n; / cin >> a >> b; / cin >> arr[i];
+        cin_match = re.match(r"cin\s*>>\s*(.+);\s*$", line)
+        if cin_match:
+            rhs = cin_match.group(1)
+            targets = [t.strip() for t in rhs.split(">>") if t.strip()]
+            if len(targets) == 1:
+                emit_statement_line(f"{normalize_expr(targets[0])} = int(input())")
+            else:
+                lhs = ", ".join(normalize_expr(t) for t in targets)
+                emit_statement_line(f"{lhs} = map(int, input().split())")
             continue
 
         # cout

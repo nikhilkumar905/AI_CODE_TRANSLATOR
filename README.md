@@ -7,12 +7,26 @@ AI-powered code translation workspace with:
 
 ## Quick Start
 
-From project root:
+From project root (`D:\AI\ai-code-translator`):
 
 ```powershell
-npm install
-npm run install:all
-npm run start:all
+# Open terminal in project root
+cd D:\AI\ai-code-translator
+
+# Install dependencies (verified on Windows PowerShell)
+npm --prefix backend install
+npm --prefix frontend install
+npm --prefix perf-checker install
+
+# Start backend + frontend in separate terminals
+npm --prefix backend run dev
+npm --prefix frontend run dev -- --port 6002
+```
+
+Alternative (all services in one terminal after dependencies are installed):
+
+```powershell
+npm run dev:all
 ```
 
 ## Deployable Structure
@@ -65,6 +79,9 @@ OLLAMA_BASE_URL=http://127.0.0.1:11434
 ```powershell
 # Start only backend
 npm --prefix backend run start
+
+# Start backend in dev mode (nodemon)
+npm --prefix backend run dev
 
 # Start only main frontend
 npm --prefix frontend run dev -- --port 6002

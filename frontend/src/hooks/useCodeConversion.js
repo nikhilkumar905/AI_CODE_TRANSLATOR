@@ -38,10 +38,25 @@ function useCodeConversion() {
         conversionTime: data.conversionTime
       };
     } catch (err) {
-      setError(err.message);
+      const isPyCppPair =
+        (sourceLanguage === 'python' && targetLanguage === 'cpp') ||
+        (sourceLanguage === 'cpp' && targetLanguage === 'python');
+
+      const rawMessage = err?.message || 'Failed to convert code';
+      const normalizedMessage = String(rawMessage).toLowerCase();
+
+      const isFetchFailure =
+        normalizedMessage.includes('failed to fetch') ||
+        normalizedMessage.includes('fetch failed');
+
+      const displayMessage = (!isPyCppPair && isFetchFailure)
+        ? 'Ollama is not available on this server. Download and run Ollama first, then try again.'
+        : rawMessage;
+
+      setError(displayMessage);
       return {
         success: false,
-        error: err.message
+        error: displayMessage
       };
     } finally {
       setIsLoading(false);
