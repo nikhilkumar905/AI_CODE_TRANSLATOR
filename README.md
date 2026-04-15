@@ -1,142 +1,267 @@
 # AI Code Translator
 
-AI-powered code translation workspace with:
-- Backend API (`backend`) on port `6001`
-- Main frontend UI (`frontend`) on port `6002`
-- Performance checker UI (`perf-checker`) on port `6003`
+Translate code between C, C++, Java, Python, and JavaScript with a hybrid backend:
 
-## Quick Start
+- Python <-> C++ uses a custom fine-tuned local model path.
+- All other language pairs are powered by Ollama.
 
-From project root (`D:\AI\ai-code-translator`):
+---
+
+## Visual Preview
+
+Add your project GIF or video link here later:
+
+- Demo GIF link: `TBD`
+- Live demo link: `TBD`
+
+---
+
+## How This Project Works
+
+### Core Routing Logic
+
+- Python -> C++ and C++ -> Python:
+	- Routed to the custom trained model service in `backend/services/trainedModelService.py`.
+	- Uses persistent worker mode with model-only fallback retry.
+- All other pairs (C, C++, Java, Python, JavaScript except Python<->C++):
+	- Routed to Ollama in `backend/services/ollamaService.js`.
+
+### Conversion Flow
+
+```mermaid
+flowchart LR
+		A[Frontend UI] --> B[POST /api/convert]
+		B --> C{Pair is Python<->C++?}
+		C -->|Yes| D[Custom Trained Model Service]
+		C -->|No| E[Ollama Service]
+		D --> F[Sanitize + Validate Output]
+		E --> F[Sanitize + Validate Output]
+		F --> G[Return Converted Code + Provider]
+		G --> H[Frontend Output Editor]
+```
+
+---
+
+## Project Structure (Analyzed)
+
+```text
+ai-code-translator/
+	backend/                Node API + routing + model services
+		routes/               API routes
+		services/             Ollama and trained-model conversion logic
+		requirements.txt      Python dependencies for model service
+		server.js             Express server entry
+
+	frontend/               Main React + Vite app
+		src/components/       Editor and language selector components
+		src/hooks/            API integration hook
+
+	perf-checker/           Optional performance testing UI
+	Model/                  Local model artifacts (config/tokenizer/weights)
+	render.yaml             Render backend deployment blueprint
+	vercel.json             Vercel frontend deployment config
+```
+
+---
+
+## Pretrained Model Summary (Python <-> C++)
+
+This summary is based on your training process and notes.
+
+### 1) Data Preparation
+
+- Loaded two JSON datasets:
+	- `dataset_50k_cpp_to_py.json`
+	- `dataset_50k_py_to_cpp.json`
+- Renamed columns for consistency:
+	- `input` -> `source_code`
+	- `output` -> `target_code`
+- Added direction tags:
+	- `cpp_to_py`
+	- `py_to_cpp`
+- Combined to 100,000 total records.
+- Formatted model input text as:
+	- `Translate {source_lang} to {target_lang}: {source_code}`
+
+### 2) Model Setup
+
+- Base model: `t5-small`
+- Tokenizer: matching T5 tokenizer from `transformers`
+- Train/Test split:
+	- 90,000 train
+	- 10,000 test
+
+### 3) Dataset + Collation
+
+- Implemented custom `CodeTranslationDataset` (`torch.utils.data.Dataset`).
+- Tokenized both input and target with max lengths:
+	- input: 512
+	- target: 512
+- Used `DataCollatorForSeq2Seq` for dynamic padding.
+
+### 4) Training
+
+- Used `Trainer` API with:
+	- epochs: 3
+	- batch size: 8
+	- warmup steps and weight decay
+	- standard logging and checkpoints
+
+### 5) Evaluation
+
+Reported metrics:
+
+- `eval_loss`: 7.522711342744515e-08
+- `eval_runtime`: 58.4231 sec
+- `eval_samples_per_second`: 171.165
+- `eval_steps_per_second`: 21.396
+- `epoch`: 3.0
+
+### 6) Save + Inference
+
+- Saved fine-tuned artifacts to `./fine_tuned_t5_model`.
+- Reloaded model/tokenizer and tested sample translations.
+
+### Dataset Links (Add Later)
+
+- C++ -> Python dataset: `TBD`
+- Python -> C++ dataset: `TBD`
+- Training notebook/script link: `TBD`
+
+---
+
+## Localhost Setup and Run
+
+Use Windows PowerShell from project root.
+
+### 1) Install dependencies
 
 ```powershell
-# Open terminal in project root
 cd D:\AI\ai-code-translator
-
-# Install dependencies (verified on Windows PowerShell)
 npm --prefix backend install
 npm --prefix frontend install
 npm --prefix perf-checker install
+```
 
-# Start backend + frontend in separate terminals
+### 2) Start services (recommended: separate terminals)
+
+Terminal A (backend):
+
+```powershell
+cd D:\AI\ai-code-translator
 npm --prefix backend run dev
+```
+
+Terminal B (frontend):
+
+```powershell
+cd D:\AI\ai-code-translator
 npm --prefix frontend run dev -- --port 6002
 ```
 
-Alternative (all services in one terminal after dependencies are installed):
+Terminal C (optional perf checker):
 
 ```powershell
-npm run dev:all
-```
-
-## Deployable Structure
-
-- `backend/`: Render web service (Node API)
-- `frontend/`: Vercel static app (Vite + React)
-- `perf-checker/`: optional local benchmark app
-- `render.yaml`: Render Blueprint config
-- `vercel.json`: root-level Vercel build and SPA routing config
-- `backend/.env.example` and `frontend/.env.example`: deployment env templates
-
-## Service URLs
-
-- Main frontend: `http://localhost:6002`
-- Perf checker: `http://localhost:6003`
-- Backend health: `http://localhost:6001/health`
-- Backend perf stats: `http://localhost:6001/health/perf`
-
-## Backend Hardening Defaults
-
-The backend includes:
-- JSON request size limit (`JSON_LIMIT`, default `1mb`)
-- Rate limiting on `/api/convert` (`RATE_LIMIT_WINDOW_MS`, default `60000`, and `RATE_LIMIT_MAX`, default `60`)
-- Conversion timeout at route level (`CONVERT_TIMEOUT_MS`, default `45000`)
-- Ollama request timeout (`OLLAMA_TIMEOUT_MS`, default `30000`)
-- Ollama model keep-alive (`OLLAMA_KEEP_ALIVE`, default `15m`)
-- Ollama model refresh cache (`OLLAMA_MODEL_REFRESH_MS`, default `300000`)
-- Trained model subprocess timeout (`TRAINED_MODEL_TIMEOUT_MS`, default `60000`)
-- Request correlation ID response header (`x-request-id`) and structured request logs
-
-## Optional Environment Variables
-
-Create `backend/.env` and set what you need:
-
-```env
-PORT=6001
-JSON_LIMIT=1mb
-RATE_LIMIT_WINDOW_MS=60000
-RATE_LIMIT_MAX=60
-CONVERT_TIMEOUT_MS=45000
-OLLAMA_TIMEOUT_MS=30000
-OLLAMA_KEEP_ALIVE=15m
-OLLAMA_MODEL_REFRESH_MS=300000
-TRAINED_MODEL_TIMEOUT_MS=60000
-OLLAMA_BASE_URL=http://127.0.0.1:11434
-```
-
-## Useful Commands
-
-```powershell
-# Start only backend
-npm --prefix backend run start
-
-# Start backend in dev mode (nodemon)
-npm --prefix backend run dev
-
-# Start only main frontend
-npm --prefix frontend run dev -- --port 6002
-
-# Start only perf checker
+cd D:\AI\ai-code-translator
 npm --prefix perf-checker run dev
 ```
 
-### Localhost Mode (Default)
-
-This project now runs in localhost-only mode for Ollama during local development:
-
-- `OLLAMA_BASE_URL=http://127.0.0.1:11434`
-- `OLLAMA_MODEL=codellama:latest`
-
-Start Ollama in a separate terminal before starting backend:
+### 3) Start Ollama locally
 
 ```powershell
 ollama serve
 ```
 
-## Verification Checklist
+---
 
-```powershell
-Invoke-WebRequest http://localhost:6001/health | Select-Object -ExpandProperty Content
-Invoke-WebRequest http://localhost:6001/health/perf | Select-Object -ExpandProperty Content
-```
+## Default Local URLs
 
-If `start:all` fails because one port is already in use, stop the existing process on that port and rerun.
+- Frontend: `http://localhost:6002`
+- Backend health: `http://localhost:6001/health`
+- Backend perf: `http://localhost:6001/health/perf`
+- Perf checker: `http://localhost:6003`
 
-## Deploy Backend To Render
+---
 
-1. Push this repository to GitHub.
-2. In Render, create a new Blueprint and point it to this repo.
-3. Render will detect `render.yaml` and create the backend service.
-4. In Render service environment variables, set:
-	- `OLLAMA_BASE_URL` to your deployed Ollama endpoint (not localhost).
-	- `OLLAMA_MODEL` to your deployed model name (for example `codellama:latest`).
-	- `CORS_ORIGINS` to your Vercel frontend URL.
-	- Optional Python/model paths (`PYTHON_EXECUTABLE`, `TRAINED_MODEL_PATH`) if you want Python<->C++ local model path explicitly configured.
-5. Deploy and verify:
-	- `https://<your-render-service>.onrender.com/health`
+## Environment Variables
 
-## Deploy Frontend To Vercel
+Copy `backend/.env.example` to `backend/.env` and configure as needed.
 
-1. Import the same repository into Vercel.
-2. Keep Root Directory as repository root.
-3. Vercel uses `vercel.json` to build `frontend` and publish `frontend/dist`.
-4. Add environment variable:
-	- `VITE_API_BASE_URL=https://<your-render-service>.onrender.com`
-5. Deploy and open the Vercel URL.
+Important keys:
 
-## Post-Deploy Check
+- `PORT`: backend port (default `6001`)
+- `CORS_ORIGINS`: allowed frontend origins
+- `OLLAMA_BASE_URL`: local or remote Ollama endpoint
+- `OLLAMA_MODEL`: model name (for example `codellama:latest`)
+- `TRAINED_MODEL_PERSISTENT`: keep Python<->C++ model worker hot
+- `TRAINED_MODEL_WORKER_IDLE_MS`: worker idle timeout
+- `TRAINED_MODEL_PATH`: path to local model artifacts
+- `PYTHON_EXECUTABLE`: Python binary path
 
-1. Open the Vercel app.
-2. Run a conversion request.
-3. Check Render logs for `http_request` entries and status `200`.
-4. Verify CORS is correct if browser shows network blocking.
+---
+
+## Features
+
+- Hybrid model routing (custom model + Ollama)
+- Source-language auto-detection support
+- Structured output sanitization for mixed-language artifacts
+- Request timeout handling and robust error responses
+- `/api/convert` rate limiting and request-size limits
+- Basic performance metrics endpoint
+- Frontend code editor, language swap, copy result, and error banner
+
+---
+
+## Deploy Overview
+
+### Backend (Render)
+
+- Uses `render.yaml`
+- Root directory: `backend`
+- Start command: `npm run start`
+
+### Frontend (Vercel)
+
+- Uses root `vercel.json`
+- Builds from `frontend`
+- Set `VITE_API_BASE_URL` to Render backend URL
+
+---
+
+## Common Troubleshooting
+
+### 1) "Ollama is not available" or fetch errors
+
+- Ensure Ollama is running and reachable from backend.
+- Verify `OLLAMA_BASE_URL` and `OLLAMA_MODEL`.
+
+### 2) Slow first request on cloud
+
+- Worker/model warm-up and network latency are expected on Render.
+- Increase worker idle timeout to reduce repeated warm starts.
+
+### 3) Port conflicts locally
+
+- Stop old processes on 6001/6002/6003 and restart.
+
+---
+
+## Scripts Quick Reference
+
+Root:
+
+- `npm run dev:all`
+- `npm run start:all`
+
+Backend:
+
+- `npm --prefix backend run dev`
+- `npm --prefix backend run start`
+
+Frontend:
+
+- `npm --prefix frontend run dev -- --port 6002`
+
+Perf checker:
+
+- `npm --prefix perf-checker run dev`
