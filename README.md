@@ -9,7 +9,7 @@ Translate code between C, C++, Java, Python, and JavaScript with a hybrid backen
 
 ## Visual Preview
 
-Add your project GIF or video link here later:
+
 
 - Demo GIF link: `TBD`
 - Live demo link: `TBD`
@@ -66,7 +66,6 @@ ai-code-translator/
 
 ## Pretrained Model Summary (Python <-> C++)
 
-This summary is based on your training process and notes.
 
 ### 1) Data Preparation
 
