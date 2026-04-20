@@ -134,6 +134,18 @@ Reported metrics:
 
 Use Windows PowerShell from project root.
 
+### 0) Install Ollama (required for most language pairs)
+
+Download and install Ollama for your OS from:
+
+- https://ollama.com/download
+
+After installation, verify it runs:
+
+```powershell
+ollama --version
+```
+
 ### 1) Install dependencies
 
 ```powershell
