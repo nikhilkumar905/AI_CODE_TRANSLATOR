@@ -12,6 +12,9 @@ def emit(payload):
     print(json.dumps(payload), flush=True)
 
 
+_MODEL_CACHE = None
+
+
 def load_model(model_dir):
     try:
         import torch
@@ -35,6 +38,22 @@ def load_model(model_dir):
     model.eval()
 
     return tokenizer, model, device
+
+
+def get_model(model_dir):
+    global _MODEL_CACHE
+    if _MODEL_CACHE is None:
+        _MODEL_CACHE = load_model(model_dir)
+    return _MODEL_CACHE
+
+
+def model_convert(code, source_lang, target_lang, model_dir):
+    tokenizer, model, device = get_model(model_dir)
+    prompt = f"Translate {source_lang} to {target_lang}: {code}"
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512)
+    inputs = {key: value.to(device) for key, value in inputs.items()}
+    outputs = model.generate(**inputs, max_length=512)
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
 
 
 class PyToCpp:
@@ -888,8 +907,6 @@ def rule_based_convert(code, source_lang, target_lang):
 
 
 def run_worker(model_dir):
-    # Keep model loading for environment validation compatibility, but do it once.
-    load_model(model_dir)
     emit({"type": "ready", "success": True})
 
     for raw in sys.stdin:
@@ -918,8 +935,14 @@ def run_worker(model_dir):
             )
             continue
 
+        mode = str(payload.get("mode", "rule")).lower()
+        use_ml = mode == "ml" or payload.get("use_ml") is True
+
         try:
-            converted = rule_based_convert(code, source_lang, target_lang)
+            if use_ml:
+                converted = model_convert(code, source_lang, target_lang, model_dir)
+            else:
+                converted = rule_based_convert(code, source_lang, target_lang)
             emit(
                 {
                     "id": req_id,
@@ -971,9 +994,6 @@ def main():
         sys.exit(1)
 
     try:
-        # Keep model loading for environment validation compatibility.
-        load_model(model_dir)
-
         converted = rule_based_convert(code, source_lang, target_lang)
 
         emit(

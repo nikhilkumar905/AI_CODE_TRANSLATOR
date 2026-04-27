@@ -358,11 +358,25 @@ function detectSourceLanguageFromCode(code) {
   return 'auto';
 }
 
-function buildPrompt(code, sourceLanguage, targetLanguage) {
+function buildPrompt(code, sourceLanguage, targetLanguage, options = {}) {
   const source = sourceLanguage === 'auto' ? 'source' : normalizeLanguage(sourceLanguage);
   const target = normalizeLanguage(targetLanguage);
-  const javaRules = targetLanguage.toLowerCase() === 'java'
+  const strict = options.strict === true;
+  const normalizedTarget = targetLanguage.toLowerCase();
+  const javaRules = normalizedTarget === 'java'
     ? `\nJava-specific rules:\n- Use a single class named Main.\n- Do not declare methods inside main.\n- Put helper methods at class scope as static methods.\n- Put shared variables at class scope as static fields.\n- main should only initialize/call methods, not define them.\n`
+    : '';
+  const cRules = normalizedTarget === 'c'
+    ? `\nC-specific rules:\n- Use only C syntax (no C++ features, no std::, no templates).\n- Include required headers (for example stdio.h, stdlib.h, string.h).\n`
+    : '';
+  const cppRules = normalizedTarget === 'cpp'
+    ? `\nC++-specific rules:\n- Use only C++ syntax (no Python/Java artifacts).\n- Include required headers at the top (for example iostream, vector, string, algorithm).\n`
+    : '';
+  const pythonRules = normalizedTarget === 'python'
+    ? `\nPython-specific rules:\n- Use only Python syntax (no C/C++/Java artifacts).\n- Include required imports (for example collections, math, heapq, bisect).\n`
+    : '';
+  const strictRules = strict
+    ? `\nStrictness rules:\n- Output MUST contain ONLY ${target} code.\n- Do NOT include snippets in other languages.\n- Start with required imports/headers if needed.\n`
     : '';
 
   return `Convert this ${source} code to ${target}.
@@ -373,7 +387,7 @@ Rules:
 - Preserve the original logic exactly.
 - Do not omit methods, loops, conditionals, imports, or class declarations.
 - Ensure all braces and blocks are balanced and closed.
-${javaRules}
+${javaRules}${cRules}${cppRules}${pythonRules}${strictRules}
 
 Source code:
 ${code}
@@ -512,14 +526,19 @@ function sanitizeConvertedOutput(text, target) {
   if (normalizedTarget === 'java') {
     output = trimToBalancedJavaCode(output);
     output = trimForeignTailForJava(output);
+    output = ensureJavaImports(output);
   } else if (normalizedTarget === 'python') {
     output = trimLeadingNonPythonForPythonTarget(output);
     output = stripInterleavedCppFromPython(output);
     output = trimForeignTailForPython(output);
     output = repairPythonFromCppArtifacts(output);
+    output = ensurePythonImports(output);
+  } else if (normalizedTarget === 'c') {
+    output = ensureCIncludes(output);
   } else if (normalizedTarget === 'cpp') {
     output = trimForeignTailForCpp(output);
     output = repairCppFromPythonArtifacts(output);
+    output = ensureCppIncludes(output);
   }
 
   return output;
@@ -576,6 +595,108 @@ function repairCppFromPythonArtifacts(text) {
   return out;
 }
 
+function ensureCppIncludes(text) {
+  let out = String(text || '').trim();
+  if (!out) return out;
+  if (/^\s*#include\s+</m.test(out)) return out;
+
+  const includes = new Set();
+  if (/(\bcout\b|\bcin\b|\bendl\b|std::(cout|cin|endl))/m.test(out)) includes.add('<iostream>');
+  if (/\bvector\s*<|std::vector/.test(out)) includes.add('<vector>');
+  if (/\bstring\b|std::string/.test(out)) includes.add('<string>');
+  if (/\bunordered_map\b|std::unordered_map/.test(out)) includes.add('<unordered_map>');
+  if (/\bunordered_set\b|std::unordered_set/.test(out)) includes.add('<unordered_set>');
+  if (/\bmap\b|std::map/.test(out)) includes.add('<map>');
+  if (/\bset\b|std::set/.test(out)) includes.add('<set>');
+  if (/\bqueue\b|std::queue|\bdeque\b|std::deque/.test(out)) includes.add('<queue>');
+  if (/\bstack\b|std::stack/.test(out)) includes.add('<stack>');
+  if (/\bpriority_queue\b|std::priority_queue/.test(out)) includes.add('<queue>');
+  if (/\bmax_element\b|\bmin_element\b|\bsort\b|\breverse\b/.test(out)) includes.add('<algorithm>');
+
+  if (includes.size === 0 && /\bstd::/.test(out)) {
+    includes.add('<bits/stdc++.h>');
+  }
+
+  if (includes.size === 0) return out;
+  const headerLines = Array.from(includes).map((h) => `#include ${h}`).join('\n');
+  return `${headerLines}\n\n${out}`;
+}
+
+function ensureCIncludes(text) {
+  let out = String(text || '').trim();
+  if (!out) return out;
+  if (/^\s*#include\s+</m.test(out)) return out;
+
+  const includes = new Set();
+  if (/\bprintf\s*\(|\bscanf\s*\(/.test(out)) includes.add('<stdio.h>');
+  if (/\bmalloc\s*\(|\bcalloc\s*\(|\brealloc\s*\(|\bfree\s*\(/.test(out)) includes.add('<stdlib.h>');
+  if (/\bstrlen\s*\(|\bstrcpy\s*\(|\bstrcmp\s*\(|\bstrcat\s*\(/.test(out)) includes.add('<string.h>');
+  if (/\bbool\b/.test(out)) includes.add('<stdbool.h>');
+
+  if (includes.size === 0) return out;
+  const headerLines = Array.from(includes).map((h) => `#include ${h}`).join('\n');
+  return `${headerLines}\n\n${out}`;
+}
+
+function ensureJavaImports(text) {
+  let out = String(text || '').trim();
+  if (!out) return out;
+  if (/^\s*import\s+java\./m.test(out)) return out;
+
+  if (/(\bList\b|\bArrayList\b|\bMap\b|\bHashMap\b|\bSet\b|\bHashSet\b|\bQueue\b|\bDeque\b|\bArrayDeque\b|\bLinkedList\b|\bArrays\b|\bCollections\b)/.test(out)) {
+    return `import java.util.*;\n\n${out}`;
+  }
+  return out;
+}
+
+function ensurePythonImports(text) {
+  let out = String(text || '').trim();
+  if (!out) return out;
+
+  const lines = out.split('\n');
+  const hasImport = (pattern) => lines.some((line) => pattern.test(line));
+  const imports = [];
+
+  if (/\bdeque\b|\bdefaultdict\b|\bCounter\b/.test(out) && !hasImport(/^\s*from\s+collections\s+import\b|^\s*import\s+collections\b/)) {
+    imports.push('from collections import deque, defaultdict, Counter');
+  }
+  if (/\bheapq\./.test(out) && !hasImport(/^\s*import\s+heapq\b/)) {
+    imports.push('import heapq');
+  }
+  if (/\bbisect\./.test(out) && !hasImport(/^\s*import\s+bisect\b/)) {
+    imports.push('import bisect');
+  }
+  if (/\bmath\./.test(out) && !hasImport(/^\s*import\s+math\b/)) {
+    imports.push('import math');
+  }
+  if (/\blru_cache\b/.test(out) && !hasImport(/^\s*from\s+functools\s+import\s+lru_cache\b/)) {
+    imports.push('from functools import lru_cache');
+  }
+
+  if (imports.length === 0) return out;
+  return `${imports.join('\n')}\n\n${out}`;
+}
+
+function looksMixedOutput(text, target) {
+  const output = String(text || '');
+  const normalizedTarget = (target || '').toLowerCase();
+
+  if (normalizedTarget === 'cpp') {
+    return /\bdef\s+\w+\s*\(|\bimport\s+\w+|public\s+class\s+\w+|\bSystem\.out\b/.test(output);
+  }
+  if (normalizedTarget === 'c') {
+    return /\bstd::|\busing\s+namespace\s+std\b|\btemplate\b|\bclass\b/.test(output);
+  }
+  if (normalizedTarget === 'python') {
+    return /#include\s*<|\busing\s+namespace\s+std\b|public\s+class\s+\w+|\bSystem\.out\b/.test(output);
+  }
+  if (normalizedTarget === 'java') {
+    return /#include\s*<|\busing\s+namespace\s+std\b|\bdef\s+\w+\s*\(|\bprint\s*\(/.test(output);
+  }
+
+  return false;
+}
+
 function normalizePythonInputForModel(code) {
   let out = String(code || '');
 
@@ -588,7 +709,7 @@ function normalizePythonInputForModel(code) {
   return out;
 }
 
-function shouldRetryModelOutput(code, target) {
+function shouldFallbackModelOutput(code, target) {
   const output = String(code || '');
   if (!output.trim()) return true;
 
@@ -598,7 +719,7 @@ function shouldRetryModelOutput(code, target) {
   ];
 
   if (unsupportedMarkers.some((marker) => output.includes(marker))) {
-    return true;
+    return false;
   }
 
   if (target === 'python') {
@@ -630,25 +751,32 @@ function shouldRetryModelOutput(code, target) {
 async function callTrainedModelWithFallback(code, sourceLang, targetLang) {
   const normalizedCode = sourceLang === 'python' ? normalizePythonInputForModel(code) : code;
   let firstErr = null;
+  let primaryResult = null;
 
   try {
     const primary = await callTrainedModelService(normalizedCode, sourceLang, targetLang);
     const cleanedPrimary = sanitizeConvertedOutput(primary.convertedCode, targetLang);
-    if (!shouldRetryModelOutput(cleanedPrimary, targetLang)) {
-      return {
-        success: true,
-        convertedCode: cleanedPrimary,
-        provider: primary.provider || 'Local Trained Model (Python<->C++)'
-      };
+    primaryResult = {
+      success: true,
+      convertedCode: cleanedPrimary,
+      provider: primary.provider || 'Local Trained Model (Python<->C++)'
+    };
+    if (!shouldFallbackModelOutput(cleanedPrimary, targetLang)) {
+      return primaryResult;
     }
   } catch (err) {
     firstErr = err;
   }
 
-  // Fallback: retry with one-shot process (still model-based, no Ollama fallback).
-  const retry = await callTrainedModelServiceOneShot(normalizedCode, sourceLang, targetLang);
+  if (!TRAINED_MODEL_PERSISTENT) {
+    if (primaryResult) return primaryResult;
+    throw new Error(firstErr ? `Model fallback disabled: ${firstErr.message}` : 'Model fallback disabled');
+  }
+
+  // Fallback: retry using the same persistent worker.
+  const retry = await callTrainedModelServicePersistent(normalizedCode, sourceLang, targetLang);
   const cleanedRetry = sanitizeConvertedOutput(retry.convertedCode, targetLang);
-  if (shouldRetryModelOutput(cleanedRetry, targetLang)) {
+  if (shouldFallbackModelOutput(cleanedRetry, targetLang)) {
     throw new Error(firstErr ? `Model fallback failed: ${firstErr.message}` : 'Model fallback failed: invalid conversion output');
   }
 
@@ -1082,6 +1210,11 @@ async function convertCode(code, sourceLanguage, targetLanguage) {
       const rawResponse = await generateWithOllama(prompt, model, estimatedPredict);
 
       let convertedCode = sanitizeConvertedOutput(extractCode(rawResponse), target);
+      if (looksMixedOutput(convertedCode, target)) {
+        const strictPrompt = buildPrompt(code, source, targetLanguage, { strict: true });
+        const strictResponse = await generateWithOllama(strictPrompt, model, estimatedPredict);
+        convertedCode = sanitizeConvertedOutput(extractCode(strictResponse), target);
+      }
 
       // Basic validation
       if (!convertedCode || convertedCode.length < 5) {

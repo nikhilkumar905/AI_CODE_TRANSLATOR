@@ -34,4 +34,4 @@ services:
       - key: TRAINED_MODEL_PERSISTENT
         value: 1
       - key: TRAINED_MODEL_WORKER_IDLE_MS
-        value: 120000
+        value: 900000
