@@ -56,7 +56,6 @@ ai-code-translator/
 		src/components/       Editor and language selector components
 		src/hooks/            API integration hook
 
-	perf-checker/           Optional performance testing UI
 	Model/                  Local model artifacts (config/tokenizer/weights)
 	render.yaml             Render backend deployment blueprint
 	vercel.json             Vercel frontend deployment config
@@ -151,7 +150,6 @@ ollama --version
 cd D:\AI\ai-code-translator
 npm --prefix backend install
 npm --prefix frontend install
-npm --prefix perf-checker install
 ```
 
 ### 2) Start services (recommended: separate terminals)
@@ -170,13 +168,6 @@ cd D:\AI\ai-code-translator
 npm --prefix frontend run dev -- --port 6002
 ```
 
-Terminal C (optional perf checker):
-
-```powershell
-cd D:\AI\ai-code-translator
-npm --prefix perf-checker run dev
-```
-
 ### 3) Start Ollama locally
 
 ```powershell
@@ -190,7 +181,6 @@ ollama serve
 - Frontend: `http://localhost:6002`
 - Backend health: `http://localhost:6001/health`
 - Backend perf: `http://localhost:6001/health/perf`
-- Perf checker: `http://localhost:6003`
 
 ---
 
@@ -273,6 +263,3 @@ Frontend:
 
 - `npm --prefix frontend run dev -- --port 6002`
 
-Perf checker:
-
-- `npm --prefix perf-checker run dev`
