@@ -12,7 +12,7 @@ Translate code between C, C++, Java, Python, and JavaScript with a hybrid backen
 
 
 
-- Live demo link: `https://ai-code-translator-sigma-five.vercel.app/`
+- Live demo link: https://ai-code-translator-sigma-five.vercel.app/
 
 ---
 
