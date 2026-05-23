@@ -11,8 +11,8 @@ Translate code between C, C++, Java, Python, and JavaScript with a hybrid backen
 
 
 
-- Demo GIF link: `TBD`
-- Live demo link: `TBD`
+
+- Live demo link: `https://ai-code-translator-sigma-five.vercel.app/`
 
 ---
 
